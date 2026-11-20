@@ -9,6 +9,7 @@ from sklearn.metrics import mean_squared_error, r2_score
 from sklearn.model_selection import TimeSeriesSplit
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
+from src.services import algorithms
 
 
 FEATURES = {"units": "产量", "run_hours": "运行小时", "temp_c": "环境温度", "idle_hours": "待机小时"}
@@ -16,6 +17,7 @@ FEATURES = {"units": "产量", "run_hours": "运行小时", "temp_c": "环境温
 
 def metadata():
     return {
+        "algorithm_version": algorithms.CURRENT_VERSION,
         "name": "车间能耗驱动归因", "short": "energy-ridge", "tagline": "用时间留出验证解释能耗驱动，并试算生产负荷变化",
         "client": "模拟客户：澄川金属一号冲压车间，三班制，6 条冲压线。",
         "workflow": "能源专员把日抄表与排产表拼接，按吨产品单耗判断异常；设备组按经验解释高耗日期。",
@@ -56,6 +58,16 @@ def _bounded(value, name, low, high):
 
 
 def analyze(records, params):
+    """Run a *new* trial with the current algorithm version.
+
+    Historical trials are replayed through ``algorithms.run`` with the version
+    recorded in their seal, never through this entry point.
+    """
+    return algorithms.run(algorithms.CURRENT_VERSION, records, params)
+
+
+@algorithms.register(algorithms.CURRENT_VERSION)
+def _analyze_v1(records, params):
     if not isinstance(records, list) or len(records) < 70:
         raise ValueError("至少需要70天能耗记录，以保留时间验证窗")
     k = _bounded(params.get("max_features", 4), "解释变量数", 2, 4)
@@ -112,6 +124,10 @@ def analyze(records, params):
     base_kwh = float(model.predict(baseline[list(features)].reshape(1, -1))[0])
     scenario_kwh = float(model.predict(scenario[list(features)].reshape(1, -1))[0])
     rows = [{"feature": FEATURES[list(FEATURES)[index]], "coefficient": round(float(coeff), 4), "baseline": round(float(baseline[index]), 3), "scenario": round(float(scenario[index]), 3)} for index, coeff in zip(features, coefficients)]
+    holdout = [
+        {"day": str(parsed[cut + offset][0]), "actual": float(actual), "predicted": float(predicted)}
+        for offset, (actual, predicted) in enumerate(zip(y[cut:], predictions))
+    ]
     warnings = ["情景超出训练期变量范围，外推风险较高。"] if any(scenario[index] < float(x[:cut, index].min()) or scenario[index] > float(x[:cut, index].max()) for index in features) else []
     if not r2_defined:
         warnings.append("留出期耗电量恒定，R²不可定义，请以RMSE判读验证误差。")
@@ -124,6 +140,7 @@ def analyze(records, params):
         "metrics": [{"label": "验证RMSE", "value": round(rmse, 3), "unit": "kWh"}, {"label": "验证R²", "value": round(r2, 4) if r2_defined else "不可定义"}, {"label": "情景日电耗", "value": round(scenario_kwh, 2), "unit": "kWh"}, {"label": "情景差额", "value": round(scenario_kwh-base_kwh, 2), "unit": "kWh"}],
         "table": {"columns": [{"key": "feature", "label": "入选特征"}, {"key": "coefficient", "label": "原始单位系数"}, {"key": "baseline", "label": "近期基准"}, {"key": "scenario", "label": "情景值"}], "rows": rows},
         "chart": {"type": "line", "labels": [str(row[0]) for row in parsed[cut:]], "series": [{"name": "留出期实测", "values": [round(float(value), 3) for value in y[cut:]]}, {"name": "留出期预测", "values": [round(float(value), 3) for value in predictions]}]},
+        "holdout": holdout,
         "findings": [f"选定岭惩罚α={alpha:g}；训练内交叉验证RMSE={cv_rmse:.3f}kWh。", f"最近14天平均特征对应基准日电耗{base_kwh:.2f}kWh，情景差额{scenario_kwh-base_kwh:+.2f}kWh。", "每折的标准化器仅在该折训练部分拟合；最后20%记录未参与变量和α选择。", "系数已还原到原始单位，解释为其他入选变量不变时的条件关联。"],
         "method": metadata()["method"], "warnings": warnings,
     }

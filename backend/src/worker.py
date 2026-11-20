@@ -4,11 +4,14 @@ from sqlalchemy import select
 from redis import Redis
 from src.config.database import Session
 from src.config.settings import REDIS_URL
-from src.models import Job, Dataset, Report
+from src.models import Job, Dataset, Report, Recheck
 from src.services.business import analyze
+from src.services.sealed import seal, run as run_recheck, recover as recover_rechecks
 from src.services.reports import deliver
 from src.services.audit import record
 logging.basicConfig(level=logging.INFO)
+
+
 def execute(job_id):
     with Session() as db:
         j=db.get(Job,job_id)
@@ -19,16 +22,32 @@ def execute(job_id):
             result=analyze(d.records,j.params)
             json.dumps(result,allow_nan=False)
             j.result=result;j.status='completed';j.finished_at=time.time()
+            seal(db,j,d)
             record(db,'worker','job.completed',{'id':j.id})
         except Exception as e:
             logging.exception('Analysis failed')
             j.status='failed';j.error=str(e)[:990];j.finished_at=time.time()
             record(db,'worker','job.failed',{'id':j.id,'error':j.error})
         db.commit()
+
+
+def rechecks():
+    with Session() as db:
+        recover_rechecks(db)
+        pending=list(db.scalars(select(Recheck.id).where(Recheck.status=='pending').limit(3)))
+    for recheck_id in pending:
+        try:
+            with Session() as db:
+                run_recheck(db,recheck_id)
+        except Exception:
+            logging.exception('Recheck retry')
+
+
 def tick():
     with Session() as db:
         queued=list(db.scalars(select(Job.id).where(Job.status=='queued').limit(3)))
     for job_id in queued:execute(job_id)
+    rechecks()
     with Session() as db:
         for r in db.scalars(select(Report).where(Report.enabled==True,Report.next_run<=time.time())):
             d=deliver(db,r)
@@ -40,6 +59,7 @@ def main():
     with Session() as db:
         for j in db.scalars(select(Job).where(Job.status=='running')):
             j.status='queued';record(db,'worker','job.recovered',{'id':j.id})
+        recover_rechecks(db)
         db.commit()
     while True:
         Path('/tmp/heartbeat').touch()
